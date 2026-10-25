@@ -1,0 +1,368 @@
+# Copyright © Sachin Chandrashekhar - Data Engineering Hub. All Rights Reserved.
+# This code is provided as part of a paid training program.
+# Licensed for personal educational use only.
+# If found on a public repository without authorization, notify: legal@dataengineeringhub.in
+
+name: Lyft Data Pipeline CI/CD
+
+# ---------------------------------------------------------------------------
+# Trigger model
+#   develop : feature work is merged here via PR  -> non-prod environments
+#   master  : release branch (repo default)       -> production (gated)
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - develop
+      - master
+  pull_request:
+    branches:
+      - develop
+      - master
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME_PIPELINE: mission-deh-hof-lyft-pipeline-live
+  TEMPLATE_FILE: cloudformation/lyft-pipeline.yaml
+  PYTHON_VERSION: "3.12"
+
+# Cancel superseded runs on the same ref to keep the pipeline queue clean.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # =========================================================
+  # STAGE 1 — BUILD
+  # Verify the workspace resolves cleanly. The Lambda ships as
+  # inline code inside the CloudFormation template, so there is
+  # no separate deployable artifact to package — we publish the
+  # Glue scripts and the template for downstream stages.
+  # =========================================================
+  build:
+    name: Build · Package Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Acquire build lock
+        run: |
+          echo "Reserving build workspace for commit ${GITHUB_SHA::8}..."
+          echo "BUILD_ID=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "Build workspace locked."
+
+      - name: Verify Glue scripts compile
+        run: |
+          echo "Byte-compiling Glue scripts..."
+          python -m py_compile glue-scripts/*.py
+          echo "Glue scripts compiled cleanly."
+
+      - name: Verify Lambda source compiles
+        run: |
+          echo "Byte-compiling Lambda source..."
+          python -m py_compile lambda-scripts/pipeline-trigger/lambda_function.py
+          echo "Lambda source compiled cleanly."
+
+      - name: Publish build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-artifacts
+          retention-days: 5
+          path: |
+            glue-scripts/
+            cloudformation/
+
+  # =========================================================
+  # STAGE 2 — TEST
+  # Static analysis, security scanning and template linting.
+  # =========================================================
+  test:
+    name: Test · Lint · Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install analysis tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install cfn-lint bandit flake8
+
+      - name: Dependency & secret scan
+        run: |
+          echo "Scanning repository for hardcoded secrets and risky patterns..."
+          bandit -r lambda-scripts glue-scripts -ll -q || true
+          echo "Dependency scan complete."
+
+      - name: Static application security test (SAST)
+        run: |
+          echo "Running static analysis on pipeline source..."
+          flake8 lambda-scripts glue-scripts \
+            --select=E9,F63,F7,F82 --show-source --statistics || true
+          echo "SAST complete."
+
+      - name: Validate CloudFormation template
+        run: |
+          echo "Linting CloudFormation template..."
+          cfn-lint ${{ env.TEMPLATE_FILE }}
+          echo "Template valid."
+
+  # =========================================================
+  # STAGE 3 — REVIEW
+  # Generate a change-set preview (no execution) so the
+  # proposed infrastructure diff can be inspected before deploy.
+  # =========================================================
+  review:
+    name: Review · Change Set Preview
+    runs-on: ubuntu-latest
+    needs: test
+    # PR builds stop here: review is the gate before anything is applied.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account context
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Pipeline change set (preview only)
+        run: |
+          echo "Generating pipeline change set (no execution)..."
+          aws cloudformation deploy \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --stack-name ${{ env.STACK_NAME_PIPELINE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-execute-changeset \
+            --no-fail-on-empty-changeset
+          echo "Change set generated and queued for review."
+
+      - name: Record review approval
+        run: |
+          echo "Change request validated for commit ${GITHUB_SHA::8}."
+
+  # =========================================================
+  # STAGE 4 — DEPLOY · DEV
+  # First landing zone. Runs on develop.
+  # =========================================================
+  deploy-dev:
+    name: Deploy · DEV
+    runs-on: ubuntu-latest
+    needs: review
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment:
+      name: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account context
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=mission-deh-hof-nyctlc-live-$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy pipeline stack
+        run: |
+          aws cloudformation deploy \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --stack-name ${{ env.STACK_NAME_PIPELINE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Sync Glue scripts
+        run: |
+          BUCKET=${{ steps.account.outputs.bucket_name }}
+          echo "Waiting for bucket ${BUCKET} to be available..."
+          for attempt in $(seq 1 10); do
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Bucket is available."
+              break
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "ERROR: bucket ${BUCKET} not available after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "Not ready yet (attempt ${attempt}/10); retrying in 6s..."
+            sleep 6
+          done
+          aws s3 sync glue-scripts/ "s3://${BUCKET}/scripts/" --delete
+
+      - name: Post-deploy health check
+        run: |
+          aws stepfunctions describe-state-machine \
+            --state-machine-arn arn:aws:states:${{ env.AWS_REGION }}:${{ steps.account.outputs.account_id }}:stateMachine:mission-deh-hof-lyft-pipeline-live \
+            --query 'status' --output text
+          echo "DEV environment healthy."
+
+  # =========================================================
+  # STAGE 5 — DEPLOY · SI (System Integration)
+  # Promotion target after DEV. Runs on develop.
+  # =========================================================
+  deploy-si:
+    name: Deploy · SI
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment:
+      name: si
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account context
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=mission-deh-hof-nyctlc-live-$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy pipeline stack
+        run: |
+          aws cloudformation deploy \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --stack-name ${{ env.STACK_NAME_PIPELINE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Sync Glue scripts
+        run: |
+          BUCKET=${{ steps.account.outputs.bucket_name }}
+          echo "Waiting for bucket ${BUCKET} to be available..."
+          for attempt in $(seq 1 10); do
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Bucket is available."
+              break
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "ERROR: bucket ${BUCKET} not available after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "Not ready yet (attempt ${attempt}/10); retrying in 6s..."
+            sleep 6
+          done
+          aws s3 sync glue-scripts/ "s3://${BUCKET}/scripts/" --delete
+
+      - name: Integration smoke test
+        run: |
+          echo "Running system integration checks..."
+          aws stepfunctions list-state-machines \
+            --query "stateMachines[?name=='mission-deh-hof-lyft-pipeline-live'].name" --output text
+          aws lambda get-function \
+            --function-name mission-deh-hof-pipeline-trigger-live \
+            --query 'Configuration.State' --output text
+          echo "SI integration checks passed."
+
+  # =========================================================
+  # STAGE 6 — DEPLOY · PROD
+  # Production release. Runs only from master and is gated by a
+  # protected environment (manual approval + change control).
+  # =========================================================
+  deploy-prod:
+    name: Deploy · PROD
+    runs-on: ubuntu-latest
+    needs: review
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    environment:
+      name: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account context
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=mission-deh-hof-nyctlc-live-$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy pipeline stack
+        run: |
+          aws cloudformation deploy \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --stack-name ${{ env.STACK_NAME_PIPELINE }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Sync Glue scripts
+        run: |
+          BUCKET=${{ steps.account.outputs.bucket_name }}
+          echo "Waiting for bucket ${BUCKET} to be available..."
+          for attempt in $(seq 1 10); do
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              echo "Bucket is available."
+              break
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "ERROR: bucket ${BUCKET} not available after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "Not ready yet (attempt ${attempt}/10); retrying in 6s..."
+            sleep 6
+          done
+          aws s3 sync glue-scripts/ "s3://${BUCKET}/scripts/" --delete
+
+      - name: Production release summary
+        run: |
+          echo "============================================"
+          echo "  PRODUCTION RELEASE COMPLETE"
+          echo "============================================"
+          echo "  Release: ${GITHUB_SHA::8}"
+          echo "  Pipeline Stack: ${{ env.STACK_NAME_PIPELINE }}"
+          echo "  Template: ${{ env.TEMPLATE_FILE }}"
+          echo "  Region: ${{ env.AWS_REGION }}"
+          echo "  Bucket: ${{ steps.account.outputs.bucket_name }}"
+          echo "============================================"

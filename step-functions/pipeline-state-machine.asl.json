@@ -1,0 +1,103 @@
+{
+  "Comment": "DEH HOF Lyft Pipeline - runs NYCTLC ingestion, raw-to-curated, and curated-to-aggregated Glue jobs in sequence. Triggered by Lambda on S3 file arrival.",
+  "StartAt": "Ingestion",
+  "States": {
+    "Ingestion": {
+      "Type": "Task",
+      "Comment": "Glue Python Shell job - downloads NYCTLC HVFHV data to the raw layer.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "mission-deh-hof-nyctlc-ingestion"
+      },
+      "ResultPath": "$.ingestionResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.InternalServiceException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "RawToCurated"
+    },
+    "RawToCurated": {
+      "Type": "Task",
+      "Comment": "Glue Spark job - transforms raw HVFHV data into the curated layer.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "mission-deh-hof-raw-to-curated-etl"
+      },
+      "ResultPath": "$.rawToCuratedResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.InternalServiceException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "CuratedToAggregated"
+    },
+    "CuratedToAggregated": {
+      "Type": "Task",
+      "Comment": "Glue Spark job - builds aggregate tables from the curated layer.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "mission-deh-hof-curated-to-aggregated-etl"
+      },
+      "ResultPath": "$.curatedToAggregatedResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.InternalServiceException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "All three Glue jobs completed successfully."
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "One of the Glue jobs failed. See the error field in the execution input for details.",
+      "Error": "PipelineFailed",
+      "Cause": "A Glue job in the pipeline failed. Check the execution history and the mission-deh-hof-job-audit DynamoDB table."
+    }
+  }
+}

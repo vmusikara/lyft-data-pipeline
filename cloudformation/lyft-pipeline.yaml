@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  DEH HOF Lyft NYCTLC Pipeline (LIVE edition). Self-contained stack that creates
+  everything it needs: the S3 data/scripts bucket, the DynamoDB audit table, the
+  three IAM roles (Glue, Lambda, Step Functions), the SNS alert topic, three Glue
+  jobs, the Step Functions state machine, and the S3-triggered Lambda. Every named
+  resource carries a "-live" suffix so this stack can run alongside any existing
+  pipeline resources without collisions.
+
+# ---------------------------------------------------------------------------
+# Parameters - only configuration, no pre-existing infrastructure required
+# ---------------------------------------------------------------------------
+Parameters:
+
+  AlertEmailAddress:
+    Type: String
+    Default: connect@dataengineeringhub.in
+    Description: >
+      Email address subscribed to the pipeline alerts SNS topic. The subscription
+      must be confirmed via the link sent to this address before alerts arrive.
+
+  IngestionScriptKey:
+    Type: String
+    Default: scripts/backup-nyctlc-ingestion.py
+    Description: S3 key of the ingestion (Python Shell) Glue script.
+
+  RawToCuratedScriptKey:
+    Type: String
+    Default: scripts/backup-raw-to-curated.py
+    Description: S3 key of the raw-to-curated (Spark) Glue script.
+
+  CuratedToAggregatedScriptKey:
+    Type: String
+    Default: scripts/backup-curated-to-aggregated.py
+    Description: S3 key of the curated-to-aggregated (Spark) Glue script.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # STORAGE
+  # =========================================================================
+
+  # --- S3: data + scripts bucket ------------------------------------------
+  # Name is account-scoped AND carries -live, so it is globally unique and
+  # will not collide with any pre-existing bucket.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "mission-deh-hof-nyctlc-live-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # --- DynamoDB: job audit table ------------------------------------------
+  JobAuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: mission-deh-hof-job-audit-live
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_name
+          AttributeType: S
+        - AttributeName: run_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_name
+          KeyType: HASH
+        - AttributeName: run_timestamp
+          KeyType: RANGE
+
+  # =========================================================================
+  # IAM ROLES
+  # =========================================================================
+
+  # --- IAM role for the Glue jobs -----------------------------------------
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-glue-role-live
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-data-access-live
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read/write the data + scripts bucket.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+              # Write audit records.
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt JobAuditTable.Arn
+              # Discover own account id (scripts call sts:GetCallerIdentity).
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              # CloudWatch Logs for Glue job output.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # --- IAM role for the trigger Lambda ------------------------------------
+  LambdaTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-lambda-trigger-role-live
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lambda-start-pipeline-live
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref LyftPipelineStateMachine
+
+  # --- IAM role for the Step Functions state machine ----------------------
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mission-deh-hof-stepfunctions-role-live
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-run-pipeline-live
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Start and monitor the Glue jobs.
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: "*"
+              # Publish success / failure alerts.
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertsTopic
+              # EventBridge-managed rule permissions required by the
+              # glue:startJobRun.sync integration pattern.
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForGlueJobRunRule"
+
+  # =========================================================================
+  # MESSAGING
+  # =========================================================================
+
+  # --- SNS: pipeline alerts topic -----------------------------------------
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: mission-deh-hof-pipeline-alerts-live
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmailAddress
+
+  # =========================================================================
+  # GLUE JOBS
+  # =========================================================================
+
+  # --- Glue job 1: NYCTLC ingestion (Python Shell) ------------------------
+  NyctlcIngestionJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-nyctlc-ingestion-live
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${DataBucket}/${IngestionScriptKey}"
+
+  # --- Glue job 2: raw -> curated (Spark ETL) -----------------------------
+  RawToCuratedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-raw-to-curated-etl-live
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucket}/${RawToCuratedScriptKey}"
+
+  # --- Glue job 3: curated -> aggregated (Spark ETL) ----------------------
+  CuratedToAggregatedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-curated-to-aggregated-etl-live
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucket}/${CuratedToAggregatedScriptKey}"
+
+  # =========================================================================
+  # ORCHESTRATION
+  # =========================================================================
+
+  # --- Step Functions: orchestration state machine ------------------------
+  LyftPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: mission-deh-hof-lyft-pipeline-live
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Lyft NYCTLC Data Pipeline - Orchestrated by Step Functions",
+            "StartAt": "RunIngestion",
+            "States": {
+              "RunIngestion": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${IngestionJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "RunRawToCurated"
+              },
+              "RunRawToCurated": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${RawToCuratedJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "RunCuratedToAggregated"
+              },
+              "RunCuratedToAggregated": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${CuratedToAggregatedJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "NotifySuccess"
+              },
+              "NotifySuccess": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${AlertsTopicArn}",
+                  "Subject": "\u2705 Lyft Pipeline Complete - Data Available",
+                  "Message": "Pipeline complete. All jobs finished successfully."
+                },
+                "Next": "PipelineSucceeded"
+              },
+              "PipelineSucceeded": {"Type": "Succeed"},
+              "NotifyFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${AlertsTopicArn}",
+                  "Subject": "\u274C Lyft Pipeline FAILED",
+                  "Message.$": "States.Format('Pipeline failed. Error: {}', $.error.Cause)"
+                },
+                "Next": "PipelineFailed"
+              },
+              "PipelineFailed": {"Type": "Fail", "Error": "PipelineExecutionFailed", "Cause": "One or more Glue jobs failed."}
+            }
+          }
+        - IngestionJobName: !Ref NyctlcIngestionJob
+          RawToCuratedJobName: !Ref RawToCuratedJob
+          CuratedToAggregatedJobName: !Ref CuratedToAggregatedJob
+          AlertsTopicArn: !Ref PipelineAlertsTopic
+
+  # =========================================================================
+  # TRIGGER
+  # =========================================================================
+
+  # --- Lambda: S3-triggered pipeline starter ------------------------------
+  PipelineTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: mission-deh-hof-pipeline-trigger-live
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaTriggerRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Architectures:
+        - x86_64
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              sfn = boto3.client('stepfunctions')
+              state_machine_arn = os.environ['STATE_MACHINE_ARN']
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  print(f"New file detected: s3://{bucket}/{key}")
+
+              response = sfn.start_execution(
+                  stateMachineArn=state_machine_arn,
+                  input=json.dumps({"trigger": "s3_event", "source_file": key})
+              )
+
+              print(f"Started Step Function execution: {response['executionArn']}")
+              return {"statusCode": 200, "executionArn": response['executionArn']}
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref LyftPipelineStateMachine
+
+  # --- Allow S3 to invoke the Lambda (event notification wiring) ----------
+  # NOTE: Adding the bucket-side notification config that targets this Lambda
+  # is still a manual step (see the S3NotificationNote output) to avoid a
+  # circular dependency between the bucket and the function. This permission
+  # grants S3 the right to invoke the function once that notification exists.
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !GetAtt DataBucket.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  DataBucketName:
+    Description: Name of the S3 data + scripts bucket created by this stack.
+    Value: !Ref DataBucket
+
+  JobAuditTableName:
+    Description: Name of the DynamoDB audit table created by this stack.
+    Value: !Ref JobAuditTable
+
+  StateMachineArn:
+    Description: ARN of the Lyft pipeline state machine.
+    Value: !Ref LyftPipelineStateMachine
+
+  AlertsTopicArn:
+    Description: ARN of the SNS alerts topic. Confirm the email subscription to receive alerts.
+    Value: !Ref PipelineAlertsTopic
+
+  TriggerFunctionArn:
+    Description: ARN of the S3-triggered pipeline Lambda.
+    Value: !GetAtt PipelineTriggerFunction.Arn
+
+  S3NotificationNote:
+    Description: Manual step required for the event-driven trigger.
+    Value: !Sub >-
+      Configure an S3 event notification on bucket ${DataBucket} (scoped to a
+      landing prefix, NOT the raw/ prefix, to avoid re-trigger loops) targeting
+      the mission-deh-hof-pipeline-trigger-live Lambda. The invoke permission is
+      already granted by this stack.
